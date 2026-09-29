@@ -5,6 +5,7 @@
 #include <io/BufferUtils.hpp>
 #include <algorithm>
 #include <optional>
+#include <string_view>
 
 namespace Elfpatcher::Windows {
 
@@ -30,7 +31,7 @@ std::string normalizeRunPath(std::string path) {
 
 }
 
-WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, const std::uint32_t entryRva, const WindowsImports& nativeImports, const std::vector<std::string>& libraries, const std::vector<PeImport>& imports, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Domain::GuestRuntime>& guestModules) const {
+WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, const std::uint32_t entryRva, const WindowsImports& nativeImports, const std::vector<std::string>& libraries, const std::vector<PeImport>& imports, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Domain::GuestRuntime>& guestModules, const bool windowsGui) const {
     if (!imports.empty() && libraries.empty())
         throw Domain::RelinkerException("ELF imports have no DT_NEEDED libraries");
     const auto path = normalizeRunPath(runPath);
@@ -51,8 +52,20 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         Io::AppendString(data, value);
         return rva;
     };
+    const auto addWideString = [&](const std::u16string_view value) {
+        const auto rva = CheckedRva(dataRva + data.size());
+        for (const auto character : value)
+            Io::AppendU16(data, static_cast<std::uint16_t>(character));
+        Io::AppendU16(data, 0);
+        return rva;
+    };
 
     const auto programPath = reserve(PathCapacity);
+    const auto guiLogPath = windowsGui ? reserve(PathCapacity * sizeof(std::uint16_t)) : 0;
+    const auto guiLogHandle = windowsGui ? reserve(8) : 0;
+    const auto guiStdoutHandle = windowsGui ? reserve(8) : 0;
+    const auto guiStderrHandle = windowsGui ? reserve(8) : 0;
+    const auto guiLogSuffix = windowsGui ? addWideString(u".log") : 0;
     const auto modulePath = reserve(PathCapacity);
     const auto handles = reserve(libraries.size() * 8);
     const auto guestFinished = reserve(4);
@@ -133,20 +146,38 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         code.Emit({0x89, 0x44, 0x24, 0x3c, 0xb9});
         code.U32(isError ? 0xfffffff4u : 0xfffffff5u);
         call("GetStdHandle");
-        requireDiagnosticSuccess();
-        code.Emit({0x48, 0x83, 0xf8, 0xff});
-        const auto validHandle = code.Branch({0x0f, 0x85});
-        raise(0xc0000001u);
-        code.PatchBranch(validHandle, code.GetRva());
+        std::vector<std::size_t> skippedWrites;
+        if (windowsGui) {
+            code.Emit({0x48, 0x85, 0xc0});
+            skippedWrites.push_back(code.Branch({0x0f, 0x84}));
+            code.Emit({0x48, 0x83, 0xf8, 0xff});
+            skippedWrites.push_back(code.Branch({0x0f, 0x84}));
+        } else {
+            requireDiagnosticSuccess();
+            code.Emit({0x48, 0x83, 0xf8, 0xff});
+            const auto validHandle = code.Branch({0x0f, 0x85});
+            raise(0xc0000001u);
+            code.PatchBranch(validHandle, code.GetRva());
+        }
         code.Emit({0x48, 0x89, 0xc1});
         code.Rip({0x48, 0x8d, 0x15}, stringRva);
         code.Emit({0x44, 0x8b, 0x44, 0x24, 0x3c, 0x4c, 0x8d, 0x4c, 0x24, 0x38, 0x48, 0xc7, 0x44, 0x24, 0x20, 0, 0, 0, 0});
         call("WriteFile");
-        requireDiagnosticSuccess();
-        code.Emit({0x8b, 0x44, 0x24, 0x38, 0x3b, 0x44, 0x24, 0x3c});
-        const auto complete = code.Branch({0x0f, 0x84});
-        raise(0xc0000001u);
-        code.PatchBranch(complete, code.GetRva());
+        if (windowsGui) {
+            code.Emit({0x85, 0xc0});
+            skippedWrites.push_back(code.Branch({0x0f, 0x84}));
+            code.Emit({0x8b, 0x44, 0x24, 0x38, 0x3b, 0x44, 0x24, 0x3c});
+            skippedWrites.push_back(code.Branch({0x0f, 0x85}));
+            const auto done = code.GetRva();
+            for (const auto skippedWrite : skippedWrites)
+                code.PatchBranch(skippedWrite, done);
+        } else {
+            requireDiagnosticSuccess();
+            code.Emit({0x8b, 0x44, 0x24, 0x38, 0x3b, 0x44, 0x24, 0x3c});
+            const auto complete = code.Branch({0x0f, 0x84});
+            raise(0xc0000001u);
+            code.PatchBranch(complete, code.GetRva());
+        }
     };
 
     const auto writeLastError = [&] {
@@ -197,6 +228,79 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     };
 
     code.Emit({0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x48, 0x83, 0xec, 0x60});
+    if (windowsGui) {
+        std::vector<std::size_t> missingStandardHandles;
+        code.Emit({0xb9});
+        code.U32(0xfffffff5u);
+        call("GetStdHandle");
+        code.Rip({0x48, 0x89, 0x05}, guiStdoutHandle);
+        code.Emit({0x48, 0x85, 0xc0});
+        missingStandardHandles.push_back(code.Branch({0x0f, 0x84}));
+        code.Emit({0x48, 0x83, 0xf8, 0xff});
+        missingStandardHandles.push_back(code.Branch({0x0f, 0x84}));
+        code.Emit({0xb9});
+        code.U32(0xfffffff4u);
+        call("GetStdHandle");
+        code.Rip({0x48, 0x89, 0x05}, guiStderrHandle);
+        code.Emit({0x48, 0x85, 0xc0});
+        missingStandardHandles.push_back(code.Branch({0x0f, 0x84}));
+        code.Emit({0x48, 0x83, 0xf8, 0xff});
+        missingStandardHandles.push_back(code.Branch({0x0f, 0x84}));
+        const auto inheritedHandlesReady = code.Branch({0xe9});
+        const auto logSetup = code.GetRva();
+        for (const auto missingHandle : missingStandardHandles)
+            code.PatchBranch(missingHandle, logSetup);
+
+        std::vector<std::size_t> skippedLogSetup;
+        code.Emit({0x31, 0xc9});
+        code.Rip({0x48, 0x8d, 0x15}, guiLogPath);
+        code.Emit({0x41, 0xb8});
+        code.U32(PathCapacity);
+        call("GetModuleFileNameW");
+        code.Emit({0x85, 0xc0});
+        skippedLogSetup.push_back(code.Branch({0x0f, 0x84}));
+        code.Emit({0x3d});
+        code.U32(PathCapacity - 5);
+        skippedLogSetup.push_back(code.Branch({0x0f, 0x87}));
+        code.Rip({0x48, 0x8d, 0x0d}, guiLogPath);
+        code.Rip({0x48, 0x8d, 0x15}, guiLogSuffix);
+        call("lstrcatW");
+        code.Rip({0x48, 0x8d, 0x0d}, guiLogPath);
+        code.Emit({0xba});
+        code.U32(0x40000000u);
+        code.Emit({0x41, 0xb8});
+        code.U32(1);
+        code.Emit({0x45, 0x31, 0xc9, 0x48, 0xc7, 0x44, 0x24, 0x20});
+        code.U32(2);
+        code.Emit({0x48, 0xc7, 0x44, 0x24, 0x28});
+        code.U32(0x80);
+        code.Emit({0x48, 0xc7, 0x44, 0x24, 0x30});
+        code.U32(0);
+        call("CreateFileW");
+        code.Emit({0x48, 0x83, 0xf8, 0xff});
+        skippedLogSetup.push_back(code.Branch({0x0f, 0x84}));
+        code.Rip({0x48, 0x89, 0x05}, guiLogHandle);
+        const auto setHandleWhenMissing = [&](const std::uint32_t stdHandle, const std::uint32_t handleRva) {
+            code.Rip({0x48, 0x8b, 0x05}, handleRva);
+            code.Emit({0x48, 0x85, 0xc0});
+            const auto setIfNull = code.Branch({0x0f, 0x84});
+            code.Emit({0x48, 0x83, 0xf8, 0xff});
+            const auto alreadySet = code.Branch({0x0f, 0x85});
+            const auto setHandle = code.GetRva();
+            code.PatchBranch(setIfNull, setHandle);
+            code.Emit({0xb9});
+            code.U32(stdHandle);
+            code.Rip({0x48, 0x8b, 0x15}, guiLogHandle);
+            call("SetStdHandle");
+            code.PatchBranch(alreadySet, code.GetRva());
+        };
+        setHandleWhenMissing(0xfffffff5u, guiStdoutHandle);
+        setHandleWhenMissing(0xfffffff4u, guiStderrHandle);
+        const auto logSetupDone = code.GetRva();
+        for (const auto skippedSetup : skippedLogSetup)
+            code.PatchBranch(skippedSetup, logSetupDone);
+        code.PatchBranch(inheritedHandlesReady, logSetupDone);
+    }
     code.Emit({0x31, 0xc9});
     code.Rip({0x48, 0x8d, 0x15}, programPath);
     code.Emit({0x41, 0xb8});

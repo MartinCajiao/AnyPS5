@@ -32,6 +32,8 @@ The relinker uses only the C++20 standard library and should build with any conf
 
 The project targets maximum compiler portability. Support for additional compilers will be addressed after the first successful game launch.
 
+For Windows output that should not open a console, pass `--windows-gui` together with `--windows` to the relinker. When the process has no inherited standard handles, the relinker writes output and errors to `<program>.exe.log` beside the generated executable when that folder is writable. Inherited handles are left intact.
+
 ## Compatibility
 
 See the [game compatibility list](docs/user/COMPATIBILITY.md) for tested games and known issues.

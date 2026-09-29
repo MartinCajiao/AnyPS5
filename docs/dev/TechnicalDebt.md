@@ -31,7 +31,7 @@ Throughout the project, every function at every stage either **does exactly what
 ### Functional
 
 - [Shader recompilation](../../core/shader/recompiler/Recompiler.cpp) currently occurs right before it was transferred to Vulkan with caching, but should be moved to the [relinker](../../core/relinker/main.cpp) stage. For this purpose, [shader/recompiler](../../core/shader/recompiler) was written completely independently from [libs/prx](../../core/libs/prx).
-- The executable file that [relinker](../../core/relinker/elfpatcher/src/windows/WindowsPeWriter.cpp) generates opens the console when launched, which is inconvenient for playability.
+- Windows executables open a console by default. `--windows-gui` avoids the console; if standard handles were not inherited, it writes output and errors to `<program>.exe.log` beside the executable when that folder is writable.
 - [Relinker](../../core/relinker/elfpatcher/src) doesn't add an icon to the generated executable. This should be done without adding dependencies (only standard).
 - `--to-intel` does not lower the register form of INSERTQ (`F2 0F 79`) nor MONITORX/MWAITX/CLZERO/RDPRU/MCOMMIT; the [lowering](../../core/relinker/codegen/src/x86/Sse4aLowering.cpp) fails the relink instead. SHA-NI is not substituted.
 - The length-changing path of the [instruction rewriter](../../core/relinker/codegen/src/x86/X64InstructionRewriter.cpp) is not used by the [converter](../../core/relinker/codegen/src/Amd64OnlyConverter.cpp): it does not adjust VEX/0F38/0F3A RIP-relative operands, data-to-code references (relocations, FDEs, jump tables) or segment sizes, so every substitution keeps the instruction length.
